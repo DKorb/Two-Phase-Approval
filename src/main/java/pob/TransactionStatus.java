@@ -1,7 +1,8 @@
 package pob;
 
 public enum TransactionStatus {
-
-    PREPARE, COMMIT, ROLLBACK
-
+    IDLE,
+    PREPARE,
+    COMMIT,
+    ROLLBACK
 }

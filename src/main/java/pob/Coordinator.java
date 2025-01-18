@@ -1,108 +1,156 @@
 package pob;
 
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
-import java.net.Socket;
-import java.util.concurrent.*;
+import java.io.*;
+import java.net.*;
 import java.util.*;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.concurrent.*;
+import java.util.logging.*;
 
 public class Coordinator {
 
-    private static final Logger logger = LoggerFactory.getLogger(Coordinator.class);
-
+    private static final Logger logger = Logger.getLogger(Coordinator.class.getName());
     private static final int NUM_SERVERS = 6;
-
-    private static final Semaphore semaphore = new Semaphore(1);
-
-    // Porty serwerów
     private static final int[] SERVER_PORTS = {5000, 5001, 5002, 5003, 5004, 5005};
+    private static final int TIMEOUT_MS = 5000; // 5 second timeout
 
-    public static void main(String[] args) {
+    private final ExecutorService executorService;
+    private final ConcurrentHashMap<Integer, ServerStatus> serverStatuses;
 
-        logger.info("Starting Coordinator with user-defined success percentage");
+    public Coordinator() {
+        this.executorService = Executors.newFixedThreadPool(NUM_SERVERS);
+        this.serverStatuses = new ConcurrentHashMap<>();
+        initializeLogging();
+    }
 
-        Scanner scanner = new Scanner(System.in);
-        while (true) {
-            logger.info("\nEnter a value to propose (or 'exit' to quit):");
-            String input = scanner.nextLine().trim();
-            if ("exit".equalsIgnoreCase(input)) {
-                logger.info("Exiting...");
-                System.exit(0);
+    private void initializeLogging() {
+        try {
+            FileHandler fh = new FileHandler("coordinator.log");
+            logger.addHandler(fh);
+            SimpleFormatter formatter = new SimpleFormatter();
+            fh.setFormatter(formatter);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public boolean startTwoPhaseCommit(int value, int successPerc) {
+        List<Future<Boolean>> prepareResults = new ArrayList<>();
+        Map<Integer, Socket> connections = new HashMap<>();
+
+        try {
+            logger.info("Starting PREPARE phase for value: " + value);
+            for (int port : SERVER_PORTS) {
+                Future<Boolean> result = executorService.submit(() ->
+                                                                    prepareServer(port, value, successPerc, connections));
+                prepareResults.add(result);
             }
 
-            int value;
-            try {
-                value = Integer.parseInt(input);
-            } catch (NumberFormatException e) {
-                logger.info("Invalid input. Please enter a number or 'exit'.");
-                continue;
+            boolean allPrepared = waitForAllResults(prepareResults);
+
+            String command = allPrepared ? "COMMIT" : "ROLLBACK";
+            logger.info("Starting " + command + " phase");
+
+            // Send commit/rollback to all servers in parallel
+            List<Future<Void>> commitResults = new ArrayList<>();
+            for (Map.Entry<Integer, Socket> conn : connections.entrySet()) {
+                Future<Void> result = executorService.submit(() -> {
+                    sendCommand(conn.getValue(), command);
+                    return null;
+                });
+                commitResults.add(result);
             }
 
-            logger.info("Enter success percentage (0-100):");
-            String percInput = scanner.nextLine().trim();
-            int successPerc;
-            try {
-                successPerc = Integer.parseInt(percInput);
-                if (successPerc < 0 || successPerc > 100) {
-                    logger.info("Percentage must be between 0 and 100.");
-                    continue;
+            // Wait for all commits/rollbacks to complete
+            waitForAllCommands(commitResults);
+
+            return allPrepared;
+
+        } catch (Exception e) {
+            logger.severe("Transaction failed: " + e.getMessage());
+            return false;
+        } finally {
+            // Close all connections
+            connections.values().forEach(socket -> {
+                try {
+                    socket.close();
+                } catch (IOException e) {
+                    logger.warning("Error closing socket: " + e.getMessage());
                 }
-            } catch (NumberFormatException e) {
-                logger.info("Invalid percentage. Please enter a number between 0 and 100.");
-                continue;
+            });
+        }
+    }
+
+    private boolean prepareServer(int port, int value, int successPerc,
+                                  Map<Integer, Socket> connections) throws IOException {
+        Socket socket = new Socket("localhost", port);
+        connections.put(port, socket);
+
+        try (PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
+
+            socket.setSoTimeout(TIMEOUT_MS);
+            out.println("PREPARE:" + value + ":" + successPerc);
+            String response = in.readLine();
+
+            boolean success = "OK".equals(response);
+            serverStatuses.put(port, new ServerStatus(port, success ? "PREPARED" : "FAILED"));
+
+            return success;
+        }
+    }
+
+    private void sendCommand(Socket socket, String command) throws IOException {
+        try (PrintWriter out = new PrintWriter(socket.getOutputStream(), true)) {
+            out.println(command);
+        }
+    }
+
+    private boolean waitForAllResults(List<Future<Boolean>> results) {
+        boolean allSuccess = true;
+        for (Future<Boolean> result : results) {
+            try {
+                allSuccess &= result.get(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                logger.warning("Server prepare failed: " + e.getMessage());
+                allSuccess = false;
             }
+        }
+        return allSuccess;
+    }
 
-            boolean success = startTwoPhaseCommit(value, successPerc);
-
-            if (success) {
-                logger.info("Transaction committed successfully!");
-            } else {
-                logger.info("Transaction rolled back due to failure.");
+    private void waitForAllCommands(List<Future<Void>> results) {
+        for (Future<Void> result : results) {
+            try {
+                result.get(TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                logger.warning("Server commit/rollback failed: " + e.getMessage());
             }
         }
     }
 
-    private static boolean startTwoPhaseCommit(int value, int successPerc) {
+    public Map<Integer, ServerStatus> getServerStatuses() {
+        return new HashMap<>(serverStatuses);
+    }
+
+    public void shutdown() {
+        executorService.shutdown();
         try {
-            semaphore.acquire();
-            logger.info("Starting Two-Phase Commit for value: {} with successPerc={}", value, successPerc);
-
-            boolean allAgreed = true;
-            Socket[] sockets = new Socket[NUM_SERVERS];
-            PrintWriter[] outs = new PrintWriter[NUM_SERVERS];
-            BufferedReader[] ins = new BufferedReader[NUM_SERVERS];
-
-            for (int i = 0; i < NUM_SERVERS; i++) {
-                sockets[i] = new Socket("localhost", SERVER_PORTS[i]);
-                outs[i] = new PrintWriter(sockets[i].getOutputStream(), true);
-                ins[i] = new BufferedReader(new InputStreamReader(sockets[i].getInputStream()));
-                outs[i].println("PREPARE:" + value + ":" + successPerc);
-                String response = ins[i].readLine();
-                if (!"OK".equals(response)) {
-                    allAgreed = false;
-                }
+            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                executorService.shutdownNow();
             }
+        } catch (InterruptedException e) {
+            executorService.shutdownNow();
+        }
+    }
 
-            String finalCommand = allAgreed ? "COMMIT" : "ROLLBACK";
-            for (int i = 0; i < NUM_SERVERS; i++) {
-                outs[i].println(finalCommand);
-            }
+    static class ServerStatus {
 
-            for (int i = 0; i < NUM_SERVERS; i++) {
-                sockets[i].close();
-            }
+        final int port;
+        final String status;
 
-            return allAgreed;
-        } catch (InterruptedException | IOException e) {
-            logger.error("Error during 2PC: {}", e.getMessage());
-            return false;
-        } finally {
-            semaphore.release();
+        ServerStatus(int port, String status) {
+            this.port = port;
+            this.status = status;
         }
     }
 }
